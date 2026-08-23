@@ -1,0 +1,9 @@
+prompts/
+context/
+
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+
+.claude/settings.local.json

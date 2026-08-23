@@ -1,0 +1,18 @@
+[project]
+name = "ollie"
+version = "0.1.0"
+description = "Terminal chat client for a local llama-server instance"
+requires-python = ">=3.9"
+dependencies = [
+    "openai>=1.0",
+]
+
+[project.scripts]
+ollie = "cli:main"
+
+[tool.setuptools]
+py-modules = ["ollie", "storage_handler", "cli"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
