@@ -495,7 +495,7 @@ class OllieApp(App):
 
 def main():
     parser = argparse.ArgumentParser(description="Terminal chat client for a local llama-server")
-    parser.add_argument("--base-url", default="http://10.0.0.25:11434/v1")
+    parser.add_argument("--base-url", default="http://localhost:11434/v1")
     parser.add_argument("--api-key", default="not-needed")
     parser.add_argument("--model", default=None, help="Model id to use (skip the picker)")
     parser.add_argument("--system-prompt-file", default=None, help="Prompt file (from prompts/) to load at startup")
