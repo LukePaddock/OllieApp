@@ -12,7 +12,7 @@ dependencies = [
 ollie = "cli:main"
 
 [tool.setuptools]
-py-modules = ["ollie", "storage_handler", "file_handler", "cli"]
+py-modules = ["ollie", "storage_handler", "file_handler", "cli", "agent"]
 
 [build-system]
 requires = ["setuptools>=61.0"]

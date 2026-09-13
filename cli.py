@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import threading
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -10,6 +11,7 @@ from textual.containers import VerticalScroll
 from textual.suggester import Suggester
 from textual.widgets import Footer, Header, Input, Markdown, Static
 
+from agent import AgentLoop, SYSTEM_PROMPT as AGENT_SYSTEM_PROMPT
 from file_handler import FileHandler
 from ollie import OllieClient, PARAM_DESCRIPTIONS, split_think
 from storage_handler import StorageHandler
@@ -118,6 +120,8 @@ Commands:
   /slice <n>               drop the first n messages from context
   /undo                    remove the last message
   /print                   render the full context (with Markdown)
+  /agent <task>            start an agent session (shell/ask_user/end loop)
+  /agent off               leave agent mode, restoring the previous prompt
   /help                    show this message\
 """
 
@@ -167,6 +171,12 @@ class OllieApp(App):
         self._chat_busy = False
         self._chat_queue = []
         self._show_thinking = False
+        self._agent_mode = False
+        self._agent_prev_prompt = None
+        self._agent_allow_all = False
+        self._awaiting_confirm = None
+        self._confirm_event = None
+        self._confirm_result = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -220,6 +230,10 @@ class OllieApp(App):
             self._handle_model_choice(text)
             return
 
+        if self._awaiting_confirm is not None:
+            self._handle_confirm_answer(text)
+            return
+
         if text.startswith("/"):
             event.input.remember(text)
             self._handle_command(text[1:])
@@ -229,6 +243,8 @@ class OllieApp(App):
         if self._chat_busy:
             self._chat_queue.append(text)
             self._log(f"(queued — {len(self._chat_queue)} waiting)", classes="queued")
+        elif self._agent_mode:
+            self._start_agent_step(text)
         else:
             self._start_chat(text)
 
@@ -295,7 +311,85 @@ class OllieApp(App):
     def _chat_finished(self):
         self._chat_busy = False
         if self._chat_queue:
-            self._start_chat(self._chat_queue.pop(0))
+            nxt = self._chat_queue.pop(0)
+            if self._agent_mode:
+                self._start_agent_step(nxt)
+            else:
+                self._start_chat(nxt)
+
+    def _enter_agent_mode(self):
+        self._agent_prev_prompt = self.client.system_prompt
+        self.client.set_system_prompt(AGENT_SYSTEM_PROMPT)
+        self._agent_mode = True
+        self._agent_allow_all = False
+
+    def _leave_agent_mode(self):
+        self.client.set_system_prompt(self._agent_prev_prompt or "")
+        self._agent_mode = False
+        self._agent_allow_all = False
+
+    def _start_agent_step(self, text):
+        self._chat_busy = True
+        self._run_agent_step(text)
+
+    @work(thread=True, exclusive=True)
+    def _run_agent_step(self, text):
+        loop = AgentLoop(self.client, confirm=self._confirm_risky)
+        try:
+            for kind, a, b in loop.run(text):
+                if kind == "shell_run":
+                    label = f"$ {a}" + (f"\n  {b}" if b else "")
+                    self.call_from_thread(self._log, label)
+                elif kind == "shell_result":
+                    exit_code, output = a, b
+                    self.call_from_thread(self._log, f"[exit {exit_code}]\n{output or '(no output)'}")
+                elif kind == "shell_denied":
+                    self.call_from_thread(self._log, f"Denied by user: {a}")
+                elif kind == "ask_user":
+                    self.call_from_thread(self._log, f"agent asks: {a}")
+                elif kind == "end":
+                    self.call_from_thread(self._log, f"agent finished: {a}")
+                elif kind == "error":
+                    self.call_from_thread(self._log, f"agent error: {a}")
+        except Exception as e:
+            self.call_from_thread(self._log, f"agent error: {e}")
+        finally:
+            self.call_from_thread(self._chat_finished)
+
+    def _confirm_risky(self, command):
+        """Called from the agent worker thread before a risky command runs.
+
+        Blocks that thread on an Event until the user answers via the input
+        box (see _handle_confirm_answer), which is submitted on the main
+        (UI) thread - same pattern as the model picker.
+        """
+        if self._agent_allow_all:
+            return True
+
+        event = threading.Event()
+        self._confirm_event = event
+        self._awaiting_confirm = command
+        self.call_from_thread(
+            self._log,
+            f"Risky command:\n  {command}\nAllow? [y]es / [N]o / [a]llow all this session",
+        )
+        event.wait()
+        return self._confirm_result
+
+    def _handle_confirm_answer(self, text):
+        answer = text.strip().lower()
+        if answer in ("a", "allow", "allow all"):
+            self._agent_allow_all = True
+            self._confirm_result = True
+            self._log("Allowing every command for the rest of this agent session, unconfirmed — "
+                       "including anything destructive. /agent off to reset it.")
+        elif answer in ("y", "yes"):
+            self._confirm_result = True
+        else:
+            self._confirm_result = False
+            self._log("Denied.")
+        self._awaiting_confirm = None
+        self._confirm_event.set()
 
     def _show_params(self):
         chat = self.query_one("#chat", VerticalScroll)
@@ -488,6 +582,24 @@ class OllieApp(App):
 
         elif command == "print":
             self._print_context()
+
+        elif command == "agent":
+            if param in ("off", "stop", "exit"):
+                if self._agent_mode:
+                    self._leave_agent_mode()
+                    self._log("Left agent mode.")
+                else:
+                    self._log("Not in agent mode.")
+            elif not param:
+                self._log("Agent mode is on. /agent off to leave." if self._agent_mode
+                           else "Usage: /agent <task>")
+            elif self._chat_busy:
+                self._log("Busy — wait for the current response to finish.")
+            else:
+                if not self._agent_mode:
+                    self._enter_agent_mode()
+                self._log(f"> {param}")
+                self._start_agent_step(param)
 
         else:
             self._log(COMMANDS)
