@@ -2,19 +2,63 @@
 
 SYSTEM_PROMPT instructs the model to reply with exactly one JSON action per
 turn - shell/ask_user/end/error - which AgentLoop parses and dispatches.
-Shell commands run via PowerShell; anything matching RISKY_PATTERNS is gated
-behind the caller-supplied `confirm` callback before it's allowed to run.
+Shell commands run through the host's native shell (PowerShell on Windows,
+sh elsewhere), and the prompt itself is generated for whichever OS this
+process is actually running on - see _PLATFORM_VARS below. Anything matching
+RISKY_PATTERNS is gated behind the caller-supplied `confirm` callback before
+it's allowed to run.
 """
 
 import json
+import platform
 import re
 import subprocess
+from string import Template
 
-SYSTEM_PROMPT = """\
-You are a Windows system agent designed to complete tasks efficiently and safely using PowerShell commands.
+IS_WINDOWS = platform.system() == "Windows"
+
+if IS_WINDOWS:
+    _PLATFORM_VARS = dict(
+        os_name="Windows",
+        shell_name="PowerShell",
+        shell_display='powershell.exe -Command "<command>"',
+        list_cmd="Get-ChildItem",
+        read_cmd="Get-Content",
+        pwd_cmd="Get-Location",
+        preview_flag="-WhatIf",
+        destructive_note="Remove-Item -Recurse, Move-Item, or permission changes",
+        elevation_note="commands that need elevation (Run as Administrator)",
+        stateful_note="`Set-Location`/`cd`",
+        chain_note="`;`",
+        disk_cmd="Get-PSDrive -PSProvider FileSystem",
+        copy_cmd="Copy-Item -Recurse 'C:\\path\\to\\project' 'C:\\backup\\20260913'",
+        list_backup_cmd="Get-ChildItem 'C:\\backup\\20260913'",
+        backup_path="C:\\backup\\20260913",
+    )
+else:
+    _PLATFORM_VARS = dict(
+        os_name=platform.system() or "a Unix-like OS",
+        shell_name="sh",
+        shell_display="sh -c \"<command>\"",
+        list_cmd="ls -la",
+        read_cmd="cat",
+        pwd_cmd="pwd",
+        preview_flag="--dry-run",
+        destructive_note="rm -rf, mv, or chmod/chown changes",
+        elevation_note="commands that need elevation (sudo)",
+        stateful_note="`cd`",
+        chain_note="`;` or `&&`",
+        disk_cmd="df -h",
+        copy_cmd="cp -r /path/to/project /backup/20260913",
+        list_backup_cmd="ls -la /backup/20260913",
+        backup_path="/backup/20260913",
+    )
+
+_PROMPT_TEMPLATE = Template("""\
+You are a $os_name system agent designed to complete tasks efficiently and safely using $shell_name commands.
 
 ## YOUR CAPABILITIES
-- Execute PowerShell commands via shell(command)
+- Execute $shell_name commands via shell(command)
 - Ask the user for clarification via ask_user(message)
 - Terminate successfully via end(message) when complete
 
@@ -37,13 +81,13 @@ You are a Windows system agent designed to complete tasks efficiently and safely
 - Plan your command sequence before acting
 
 ### 2. COMMAND EXECUTION RULES
-- Always start with safe, read-only commands when possible (Get-ChildItem, Get-Content, Get-Location)
-- Use -WhatIf or preview flags before destructive operations where the cmdlet supports it
+- Always start with safe, read-only commands when possible ($list_cmd, $read_cmd, $pwd_cmd)
+- Use $preview_flag or preview flags before destructive operations where the command supports it
 - Verify file/directory contents before modifications
 - Use absolute paths when ambiguous
 - Handle errors gracefully: check exit codes, read output
-- For file operations: always confirm before Remove-Item -Recurse, Move-Item, or permission changes on sensitive items
-- Each shell command runs standalone (`powershell.exe -Command "<command>"`) - it does NOT share state with the previous command, so `Set-Location`/`cd` doesn't persist between steps. Use absolute paths, or chain steps with `;` inside one command when they need to share state.
+- For file operations: always confirm before $destructive_note on sensitive items
+- Each shell command runs standalone (`$shell_display`) - it does NOT share state with the previous command, so $stateful_note doesn't persist between steps. Use absolute paths, or chain steps with $chain_note inside one command when they need to share state.
 
 ### 3. USER INTERACTION
 - Ask ask_user(message) when:
@@ -57,7 +101,7 @@ You are a Windows system agent designed to complete tasks efficiently and safely
 ### 4. SAFETY FIRST
 - Never execute commands without understanding their impact
 - Avoid hardcoded secrets or passwords in commands
-- Be cautious with commands that need elevation (Run as Administrator)
+- Be cautious with $elevation_note
 - Don't assume read/write permissions; test first
 - If uncertain, ask the user instead of guessing
 - Some commands (deletions, moves, formatting, process/service control, force pushes, etc.) require the user's explicit approval before they run - expect that a command may come back denied, and adapt instead of retrying the same thing
@@ -73,15 +117,15 @@ You are a Windows system agent designed to complete tasks efficiently and safely
 ## EXAMPLE FLOWS
 
 User: "Check my disk usage"
-1. {"type": "shell", "message": "Checking disk usage...", "command": "Get-PSDrive -PSProvider FileSystem"}
-2. {"type": "end", "message": "C: drive is at 65% used - see the output above."}
+1. {"type": "shell", "message": "Checking disk usage...", "command": "$disk_cmd"}
+2. {"type": "end", "message": "Disk usage checked - see the output above."}
 
 User: "Create a backup of my project"
 1. {"type": "ask_user", "message": "Which directory is your project in?"}
 2. {"type": "ask_user", "message": "Please confirm the backup destination path."}
-3. {"type": "shell", "message": "Creating backup...", "command": "Copy-Item -Recurse 'C:\\path\\to\\project' 'C:\\backup\\20260913'"}
-4. {"type": "shell", "message": "Verifying backup...", "command": "Get-ChildItem 'C:\\backup\\20260913'"}
-5. {"type": "end", "message": "Backup created successfully at C:\\backup\\20260913"}
+3. {"type": "shell", "message": "Creating backup...", "command": "$copy_cmd"}
+4. {"type": "shell", "message": "Verifying backup...", "command": "$list_backup_cmd"}
+5. {"type": "end", "message": "Backup created successfully at $backup_path"}
 
 ## ERROR HANDLING
 If a command fails or is denied:
@@ -99,22 +143,37 @@ If a command fails or is denied:
 - Never include markdown formatting (```json, etc.)
 
 Remember: Clear, safe, efficient execution. All responses must be valid JSON.
-"""
+""")
+
+SYSTEM_PROMPT = _PROMPT_TEMPLATE.safe_substitute(_PLATFORM_VARS)
 
 # Commands the model shouldn't be trusted to run without a human confirming
 # first - deletions, moves, permission/process/service control, force
-# pushes, and the like. Deliberately broad: false positives just mean an
-# extra confirm prompt, false negatives mean unattended damage.
+# pushes, and the like. Covers both Windows and POSIX spellings so the same
+# list works regardless of which OS this happens to run on. Deliberately
+# broad: false positives just mean an extra confirm prompt, false negatives
+# mean unattended damage.
 RISKY_PATTERNS = [
+    # Windows / PowerShell
     r"\bremove-item\b",
     r"\brd\b|\brmdir\b|\bdel\b|\berase\b",
-    r"\bmove-item\b|\bmv\b|\brename-item\b|\bren\b",
+    r"\bmove-item\b|\brename-item\b|\bren\b",
     r"\bformat\b|\bdiskpart\b|\bclear-disk\b",
     r"\bstop-process\b|\btaskkill\b|\bstop-service\b|\brestart-service\b",
     r"\brestart-computer\b|\bstop-computer\b|\bshutdown\b",
     r"\bset-executionpolicy\b",
     r"\breg(?:\.exe)?\s+(add|delete)\b",
     r"\bicacls\b|\btakeown\b",
+    # POSIX (Linux/macOS)
+    r"\brm\b|\bmv\b",
+    r"\bchmod\b|\bchown\b|\bchflags\b",
+    r"\bsudo\b|\bdoas\b",
+    r"\bdd\b|\bmkfs\b",
+    r"\bkill\b|\bpkill\b|\bkillall\b",
+    r"\breboot\b|\bpoweroff\b|\bhalt\b",
+    r"\bsystemctl\s+(stop|disable|mask)\b",
+    r"\blaunchctl\s+(unload|remove)\b",
+    # Cross-platform
     r"--force\b",
     r"\bgit\s+push\s+.*--force\b",
     r"\bgit\s+reset\s+--hard\b",
@@ -149,17 +208,23 @@ def parse_action(text):
     return data
 
 
+def _shell_argv(command):
+    if IS_WINDOWS:
+        return ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command]
+    return ["/bin/sh", "-c", command]
+
+
 def run_shell(command, timeout=SHELL_TIMEOUT):
-    """Run `command` via PowerShell, returning (exit_code, output)."""
+    """Run `command` through the host's native shell, returning (exit_code, output)."""
     try:
         proc = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+            _shell_argv(command),
             capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired:
         return None, f"(timed out after {timeout}s)"
     except FileNotFoundError:
-        return None, "powershell.exe not found on PATH"
+        return None, "shell executable not found on PATH"
 
     output = proc.stdout
     if proc.stderr:
